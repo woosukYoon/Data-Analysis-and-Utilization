@@ -1,0 +1,916 @@
+---
+title: "Assignment_6"
+author: "wooseokYoon"
+date: "2023-05-23"
+output: 
+  html_document: 
+    highlight: tango
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+# Sentiment Analysis on Movie Review Dataset
+
+"imdb.csv" 파일은 영화 리뷰 사이트인 IMDB로부터 추출한 10,000개의 영화 리뷰 정보를 포함하며 다음 2개의 column으로 구성되어 있다.
+
+• review: 리뷰 텍스트
+
+• sentiment: "negative" or "positive"
+
+데이터셋 중에서 5,028개는 평점 7점 이상을 기록한 positive 리뷰이며, 나머지 4,972개는 평점 4점 이하를 기록한 negative 리뷰이다.
+평점 5\~6점을 기록한 리뷰는 데이터셋에 포함되지 않았다.
+그리고 영화 하나당 최대 30개의 리뷰를 포함하고 있다.
+본 과제에서는 영화 리뷰 텍스트로부터 리뷰의 positive/negative 여부를 판별하기 위한 모델을 만들어본다.
+
+```{r message=FALSE}
+# 사용할 패키지 추가
+library(wordcloud)
+library(tm)
+library(SnowballC)
+library(class)
+library(caret)
+library(glmnet)
+library(kernlab)
+library(e1071)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(ggplot2)
+```
+
+1.  모델을 수립하기 전에 데이터의 특성을 분석한다. wordcloud 등의 시각화 도구를 적절히 활용하자.
+
+```{r}
+# 데이터 파일 읽기
+imdb_raw <- read.csv("imdb.csv")
+str(imdb_raw)
+
+# target 변수 factor 변환
+imdb_raw$sentiment <- factor(imdb_raw$sentiment)
+str(imdb_raw$sentiment)
+
+# positive/neagtive 리뷰 분포 확인
+table(imdb_raw$sentiment)
+
+# positive 리뷰와 negative 리뷰 분리
+pos <- subset(imdb_raw, sentiment == "positive")
+neg <- subset(imdb_raw, sentiment == "negative")
+
+# word cloud 생성을 통해 positive와 negative 리뷰에서 빈번하게 등장하는 단어 시각화
+wordcloud(pos$review, max.words = 40, colors = brewer.pal(8, "Accent"))
+wordcloud(neg$review, max.words = 40, colors = brewer.pal(9, "Set1"))
+```
+
+**Answer) postive와 negative의 리뷰 분포는 거의 5:5 분포임을 확인할 수 있다.**
+
+2.  전체 10,000개의 리뷰 텍스트를 대상으로 corpus를 생성하고 bag-of-words 기법을 적용하기 위해 적절한 preprocessing을 수행해보자.
+
+<!-- -->
+
+A.  강의노트에서 다룬 모든 preprocessing 단계를 순서대로 수행한다.
+
+```{r}
+# imdb review corpus 생성
+imdb_corpus <- VCorpus(VectorSource(imdb_raw$review))
+imdb_corpus
+
+# 모든 대문자를 소문자로 변환
+imdb_corpus_clean <- tm_map(imdb_corpus, content_transformer(tolower))
+
+# 숫자 제거
+imdb_corpus_clean <- tm_map(imdb_corpus_clean, removeNumbers)
+
+# 불용어 제거
+imdb_corpus_clean <- tm_map(imdb_corpus_clean, removeWords, stopwords())
+
+# 문장부호 제거
+imdb_corpus_clean <- tm_map(imdb_corpus_clean, removePunctuation)
+
+# stemming 실시(어미 제거)
+imdb_corpus_clean <- tm_map(imdb_corpus_clean, stemDocument)
+
+# 공백 제거
+imdb_corpus_clean <- tm_map(imdb_corpus_clean, stripWhitespace)
+```
+
+B.  원 텍스트와 preprocessing 후의 텍스트 사이에 어떤 변화가 있는지 리뷰 텍스트의 예를 들어 비교해보자.
+
+```{r}
+# 원 텍스트
+imdb_corpus[[111]]$content
+
+# 전처리 후 텍스트
+imdb_corpus_clean[[111]]$content
+```
+
+**Answer) 원 텍스트와 전처리 후 텍스트를 비교해보면, 확실히 눈에 보기에도 문장부호나 공백이 지워졌음을 확인할 수 있다. 또, "i"나 "as" 등 불용어가 제거됬음을 확인할 수 있으며, "possibly"가 "possibl"이 되고 "choreographed"가 "choreograph"가 된 것으로 보아 stemming이 되어 어미가 없어졌음을 볼 수 있다. "Apparently"의 대문자 A는 소문자 a가 됬으며, "Jonathan"의 대문자 J도 소문자 j로 변경되었다.**
+
+3.  Document-Term Matrix (DTM) 와 TF-IDF matrix를 생성하자. 그리고 출현 빈도 수가 낮은 단어(term)를 DTM과 TD-IDF matrix에서 제외한다. 이때 출현 빈도 수가 낮은 단어를 삭제한 기준은 무엇이며, 단어의 수가 얼마나 줄어들었는가?
+
+```{r}
+# DTM 생성
+imdb_dtm <- DocumentTermMatrix(imdb_corpus_clean)
+imdb_dtm
+inspect(imdb_dtm[1:5, 1:10])
+
+# 전처리된 DTM의 TF-IDF 값 계산
+imdb_tfidf <- weightTfIdf(imdb_dtm)
+inspect(imdb_tfidf[1:5,])
+
+# 전체 review 중에 5% 미만의 review에서 발생하는 단어는 제외
+imdb_dtm2 <- removeSparseTerms(imdb_dtm, 0.950)
+imdb_dtm2
+
+# 전체 review 중에 5% 미만의 review에서 발생하는 단어는 제외
+imdb_tfidf2 <- removeSparseTerms(imdb_tfidf, 0.950)
+imdb_tfidf2
+```
+
+**Answer) 기준으로 전체 review 중에 5% 미만의 review에서 발생하는 단어는 제외시켰다. %값은 계산량 및 계산 시간을 고려하여 설정하였다. 단어의 수는 48717개에서 353개의 단어로 줄어들었다.**
+
+4.  계산 시간을 고려하여 첫 3,000개의 데이터를 training set으로, 나머지 7,000개의 데이터를 test set으로 사용한다. Training set을 사용하여 리뷰텍스트의 positive/negative 여부를 판별하기 위한 predictive model을 만들어보자.
+
+<!-- -->
+
+A.  지금까지 강의에서 학습한 모델을 최대한 활용해보고, 분석 과정과 결과를 report하자. 사용한 모델, 모델에 포함되는 파라미터에 대한 튜닝, 모델에 포함되는 feature의 수, DTM/TF-IDF 사용 여부 등이 classification accuracy에 영향을 미칠 수 있다. [주의: 모델을 수립할 때에는 test set을 사용하여 성능을 비교할 수 없다. 모델 간의 성능 비교를 위해서는 training set 중 일부를 validation set으로 활용하자.
+
+```{r}
+# DTM을 데이터프레임으로 변환.
+imdb <- data.frame(as.matrix(imdb_dtm2))
+str(imdb)
+sum(is.na(imdb))
+
+# 데이터프레임에 target 변수 추가.
+imdb$sentiment <- imdb_raw$sentiment 
+
+# validation set을 제외한 첫 2000개 데이터를 모델을 training set으로 사용.
+imdb_train <- imdb[1:2000,]
+
+# validation set으로 training set의 마지막 1000개의 데이터를 사용.
+imdb_valid <- imdb[2001:3000,]
+
+# test set으로 나머지 7000개 데이터를 사용.
+imdb_test <- imdb[3001:10000,]
+
+# TF-IDF matrix를 데이터프레임으로 변환
+imdb_tfidf <- data.frame(as.matrix(imdb_tfidf2))
+
+# 데이터프레임에 target 변수 추가.
+imdb_tfidf$sentiment <- imdb_raw$sentiment
+
+# DTM 데이터프레임과 같은 조건의 split으로 training set 생성.
+imdb_tfidf_train <- imdb_tfidf[1:2000,]
+
+# DTM 데이터프레임과 같은 조건의 split으로 validation set 생성.
+imdb_tfidf_valid <- imdb_tfidf[2001:3000,]
+
+# DTM 데이터프레임과 같은 조건의 split으로 test set 생성.
+imdb_tfidf_test <- imdb_tfidf[3001:10000,]
+```
+
+#### ● KNN model
+
+-   DTM data
+
+```{r}
+# K 값과 Accuracy 값을 저장할 vector 생성
+K = vector()
+Knn_Accuracy = vector()
+
+# DTM data 사용 knn 진행
+for(i in seq(1, 351, by=10)){
+  set.seed(123)
+  # training set을 이용한 model 학습 후 validation set 결과 예측
+  imdb_test_pred_knn <- knn(train = imdb_train[,-354], test = imdb_valid[,-354], cl = imdb_train$sentiment, k=i)
+  model_pred_knn <- confusionMatrix(imdb_test_pred_knn, imdb_valid$sentiment)
+  # K값 저장
+  K <- append(K, i)
+  # Accuracy 값 저장
+  Knn_Accuracy <- append(Knn_Accuracy, model_pred_knn$overall[1])
+}
+
+# k에 따른 모델의 Accuracy 값 데이터프레임 생성
+df_knn1 <- data.frame(K, Accuracy = Knn_Accuracy)
+df_knn1
+
+# k에 따른 모델의 Accuracy 변화 그래프로 시각화
+knn_plot1 <- ggplot(df_knn1, aes(x=K, y=Accuracy)) + geom_line() + geom_point() + theme_bw()
+knn_plot1
+
+# vector 초기화
+K = vector()
+Knn_Accuracy = vector()
+
+# 더 좋은 성능을 가지는 k 값을 찾기 위해 위 결과에서 가장 Accuracy가 높은 k 값 주변 범위로 i 값을 설정하여 한 번 더 반복
+for(i in seq(13, 33, by=2)){
+  set.seed(123)
+  # training set을 이용한 model 학습 후 validation set 결과 예측
+  imdb_test_pred_knn <- knn(train = imdb_train[,-354], test = imdb_valid[,-354], cl = imdb_train$sentiment, k=i)
+  model_pred_knn <- confusionMatrix(imdb_test_pred_knn, imdb_valid$sentiment)
+  # K값 저장
+  K <- append(K, i)
+  # Accuracy 값 저장
+  Knn_Accuracy <- append(Knn_Accuracy, model_pred_knn$overall[1])
+}
+
+# k에 따른 모델의 Accuracy 값 데이터프레임 생성
+df_knn2 <- data.frame(K, Accuracy = Knn_Accuracy)
+df_knn2
+
+# k에 따른 모델의 Accuracy 변화 그래프로 시각화
+knn_plot2 <- ggplot(df_knn2, aes(x=K, y=Accuracy)) + geom_line() + geom_point() + theme_bw()
+knn_plot2
+```
+
+**Answer) DTM data를 사용시, KNN model은 k가 21일 때 validation set에 대한 Accuracy가 가장 높았으며 그 때 Accuracy 값은 0.648이다.**
+
+-   TF-IDF data
+
+```{r}
+# vector 초기화
+K = vector()
+Knn_Accuracy = vector()
+
+# TF-IDF 을 사용 data knn 진행
+for(i in seq(1, 351, by=10)){
+  set.seed(123)
+  # training set을 이용한 model 학습 후 validation set 결과 예측
+  imdb_test_pred_knn2 <- knn(train = imdb_tfidf_train[,-354], test = imdb_tfidf_valid[,-354], cl = imdb_tfidf_train$sentiment, k=i)
+  model_pred_knn2 <- confusionMatrix(imdb_test_pred_knn2, imdb_tfidf_valid$sentiment)
+  # K값 저장
+  K <- append(K, i)
+  # Accuracy 값 저장
+  Knn_Accuracy <- append(Knn_Accuracy, model_pred_knn2$overall[1])
+}
+
+# k에 따른 모델의 Accuracy 값 데이터프레임 생성
+df_knn3 <- data.frame(K, Accuracy = Knn_Accuracy)
+df_knn3
+
+# k에 따른 모델의 Accuracy 변화 그래프로 시각화
+knn_plot3 <- ggplot(df_knn3, aes(x=K, y=Accuracy)) + geom_line() + geom_point() + theme_bw()
+knn_plot3
+
+# vector 초기화
+K = vector()
+Knn_Accuracy = vector()
+
+# 더 좋은 성능을 가지는 k 값을 찾기 위해 위 결과에서 가장 Accuracy가 높은 k 값 주변 범위로 i 값을 설정하여 한 번 더 반복
+for(i in seq(13, 33, by=2)){
+  set.seed(123)
+  # training set을 이용한 model 학습 후 validation set 결과 예측
+  imdb_test_pred_knn2 <- knn(train = imdb_tfidf_train[,-354], test = imdb_tfidf_valid[,-354], cl = imdb_tfidf_train$sentiment, k=i)
+  model_pred_knn2 <- confusionMatrix(imdb_test_pred_knn2, imdb_tfidf_valid$sentiment)
+  # K값 저장
+  K <- append(K, i)
+  # Accuracy 값 저장
+  Knn_Accuracy <- append(Knn_Accuracy, model_pred_knn2$overall[1])
+}
+
+# k에 따른 모델의 Accuracy 값 데이터프레임 생성
+df_knn4 <- data.frame(K, Accuracy = Knn_Accuracy)
+df_knn4
+
+# k에 따른 모델의 Accuracy 변화 그래프로 시각화
+knn_plot4 <- ggplot(df_knn4, aes(x=K, y=Accuracy)) + geom_line() + geom_point() + theme_bw()
+knn_plot4
+```
+
+**Answer) TF-IDF data를 사용시, knn model은 k가 17일 때 validation set에 대한 Accuracy가 가장 높았으며 그 때 Accuracy 값은 0.664이다.**
+
+**최종적으로 KNN model에서는 TF-IDF를 사용하고 파리미터 값으로 k를 17을 넣었을 때 모델이 성능이 가장 좋다.**
+
+**KNN 학습 과정에서 시드값을 지정해준 이유는 Accuracy의 변동 때문에 지정했다. 변동의 이유는 data set의 열이 단어의 빈도수를 나타내기에 0의 값을 갖는 열이 많고 그에 따라 행의 구성이 비슷하기 때문이라고 예상한다. 그로 인해 행 data 간의 동일한 거리가 있을 것으로 예상되고 그로 인해 학습의 결과가 바뀐다고 생각한다.**
+
+#### ● Logistic regression model
+
+-   DTM data
+
+```{r}
+# DTM data를 사용하여 Logistic regression 진행.
+lr1 <- glm(sentiment~., data=imdb_train, family="binomial")
+summary(lr1)
+
+# 확률 계산
+lr_prob1 <- predict(lr1, imdb_valid, type="response")
+
+# data index에 따른 확률값 분포
+plot(lr_prob1)
+lr_pred1 <- rep("negative", nrow(imdb_valid))
+
+# threshold 0.5로 설정
+lr_pred1[lr_prob1 > 0.5] <- "positive"
+
+# threshold를 기준에 따라 분류된 클래스를 색깔로 시각화.
+plot(lr_prob1, col = ifelse(lr_prob1 >= 0.5, "purple", "green"))
+
+# confusionMatrix 결과
+confusionMatrix(factor(lr_pred1), imdb_valid$sentiment, positive="positive")
+```
+
+**Answer) DTM data를 사용시, logistic regression model의 validation set에 대한 Accuracy 값은 0.779이다.**
+
+-   TF-IDF Data
+
+```{r}
+# TF_IDF를 적용한 data를 사용하여 Logistic regression 진행.
+lr2 <- glm(sentiment~., data=imdb_tfidf_train, family="binomial")
+
+# 확률 계산
+lr_prob2 <- predict(lr2, imdb_tfidf_valid, type="response")
+
+# data index에 따른 확률값 분포
+plot(lr_prob2)
+lr_pred2 <- rep("negative", nrow(imdb_tfidf_valid))
+
+# threshold 0.5로 설정
+lr_pred2[lr_prob2 > 0.5] <- "positive"
+
+# threshold를 기준에 따라 분류된 클래스를 색깔로 시각화.
+plot(lr_prob2, col = ifelse(lr_prob2 >= 0.5, "purple", "green"))
+
+# confusionMatrix 결과
+confusionMatrix(factor(lr_pred2), imdb_tfidf_valid$sentiment, positive="positive")
+```
+
+**Answer) TF-IDF data를 사용시, logistic regression model의 validation set에 대한 Accuracy 값은 0.783이다.**
+
+**최종적으로 기본 logistic regression model은 TF-IDF data를 사용했을 때 모델의 성능이 가장 좋다.**
+
+#### ● Ridge regularization 적용 logistic regression model
+
+-   DTM data
+
+```{r}
+# DTM 데이터를 사용한 feature matrix 생성
+trainX <- model.matrix(sentiment~., data=imdb_train)[,-1] 
+trainY <- imdb_train$sentiment
+
+# logistic regression model에 lasso regularization 적용
+ridge_model <- glmnet(x=trainX, y=trainY, alpha = 0, family="binomial") 
+
+# lambda에 따른 coefficient 값 변화
+plot(ridge_model, xvar="lambda", label = TRUE)
+
+# DTM 데이터를 사용한 예측할 validation set의 feature matrix 생성
+valid_imdb <- model.matrix(sentiment~.,imdb_valid)[,-1]
+
+# lambda의 log값과 Accuracy 값을 삽입할 vector 생성
+log_lambda <- vector()
+ridge_Accuracy <- vector()
+
+# ridge_model에서 사용한 lambda 값의 변화에 따른 validation set 예측 결과
+for (i in 1:100){
+  # training set으로 학습된 model로 validation set 예측
+  ridge_pred <- predict(ridge_model, s=ridge_model$lambda[i], newx = valid_imdb, type = "class")
+  ridge_cM <- confusionMatrix(factor(ridge_pred, levels = c("negative", "positive")), imdb_valid$sentiment, positive = "positive")
+  # Accuracy 값 저장
+  ridge_Accuracy <- c(ridge_Accuracy, ridge_cM$overall[1])
+  # lambda의 log 값 저장
+  log_lambda <- c(log_lambda, log(ridge_model$lambda[i]))
+}
+
+# lambda 값에 따른 Accuracy 값 데이터프레임
+df_ridge1 <- data.frame(log_lambda = log_lambda, Accuracy = ridge_Accuracy) 
+df_ridge1
+
+# lambda 값에 따른 Accuracy 값 시각화
+ridge_plot1 <- ggplot(df_ridge1, aes(x=log_lambda, y=Accuracy)) + geom_point() + geom_line()
+ridge_plot1
+
+# 최적 lambda 값
+ridge_model$lambda[88]
+```
+
+**Answer) DTM data를 사용시, Ridge regularization 적용 logistic regression model은 lambda 값이 0.0421657일 때 validation set에 대한 Accuracy가 가장 높았으며 그 때 Accuracy 값은 0.820이다.**
+
+-   TF-IDF data
+
+```{r}
+# TF-IDF 데이터를 사용한 feature matrix 생성
+train_tfidfX <- model.matrix(sentiment~., data=imdb_tfidf_train)[,-1] 
+train_tfidfY <- imdb_tfidf_train$sentiment
+
+# logistic regression model에 ridge regularization 적용
+ridge_tfidf_model <- glmnet(x=train_tfidfX, y=train_tfidfY, alpha = 0, family="binomial")
+
+# lambda에 따른 coefficient 값 변화
+plot(ridge_tfidf_model, xvar="lambda", label = TRUE)
+
+# TF-IDF 데이터를 사용한 예측할 validation set의 feature matrix 생성
+valid_imdb_tfidf <- model.matrix(sentiment~.,imdb_tfidf_valid)[,-1]
+
+# vector 초기화
+log_lambda <- vector()
+ridge_Accuracy <- vector()
+
+# Ridge model에서 사용한 lambda 값의 변화에 따른 validation set 예측 결과
+for (i in 1:100){
+  # training set으로 학습된 model로 validation set 예측
+  ridge_tfidf_pred <- predict(ridge_tfidf_model, s=ridge_tfidf_model$lambda[i], newx = valid_imdb_tfidf, type = "class")
+  ridge_tfidf_cM <- confusionMatrix(factor(ridge_tfidf_pred, levels = c("negative", "positive")), imdb_tfidf_valid$sentiment, positive = "positive")
+  # Accuracy 값 저장
+  ridge_Accuracy <- c(ridge_Accuracy, ridge_tfidf_cM$overall[1])
+  # lambda의 log 값 저장
+  log_lambda <- c(log_lambda, log(ridge_model$lambda[i]))
+}
+
+# lambda 값에 따른 Accuracy 값 데이터프레임
+df_ridge2 <- data.frame(log_lambda, Accuracy = ridge_Accuracy)
+df_ridge2
+
+# lambda 값에 따른 Accuracy 값 시각화
+ridge_plot2 <- ggplot(df_ridge2, aes(x=log_lambda, y=Accuracy)) + geom_point() + geom_line()
+ridge_plot2
+
+# 최적 lambda 값
+ridge_model$lambda[61]
+```
+
+**Answer) TF-IDF data를 사용시, Ridge regularization 적용 logistic regression model은 lambda 값이 0.5198385일 때 validation set에 대한 Accuracy가 가장 높았으며 그 때 Accuracy 값은 0.800이다.**
+
+**최종적으로 Ridge regularization 적용 logistic regression model에서는 DTM data를 사용하고 파라미터 값으로 lambda 값을 0.0421657을 넣었을 때 모델이 성능이 가장 좋다.**
+
+**Ridge regularization은 기본 logistic regression보다 Accuracy 측면에서 성능 향상은 나타났지만 feature의 수를 줄이는 것은 아니기에 모델 해석력 측면에서는 향상되었다고는 볼 수 없다.**
+
+#### ● Lasso regularization 적용 logistic regression model
+
+-   DTM data
+
+```{r}
+# DTM 데이터를 사용한 feature matrix 생성
+trainX <- model.matrix(sentiment~., data=imdb_train)[,-1] 
+trainY <- imdb_train$sentiment
+
+# logistic regression model에 lasso regularization 적용
+lasso_model <- glmnet(x=trainX, y=trainY, alpha = 1, family="binomial") 
+
+# lambda에 따른 coefficient 값 변화
+plot(lasso_model, xvar="lambda", label = TRUE)
+
+# DTM 데이터를 사용한 예측할 validation set의 feature matrix 생성
+valid_imdb <- model.matrix(sentiment~.,imdb_valid)[,-1]
+
+# lambda의 log값과 Accuracy 값을 삽입할 vector 생성
+log_lambda <- vector()
+lasso_Accuracy <- vector()
+
+# lasso model에서 사용한 lambda 값의 변화에 따른 validation set 예측 결과
+for (i in 1:84){
+  # training set으로 학습된 model로 validation set 예측
+  lasso_pred <- predict(lasso_model, s=lasso_model$lambda[i], newx = valid_imdb, type = "class")
+  lasso_cM <- confusionMatrix(factor(lasso_pred, levels = c("negative", "positive")), imdb_valid$sentiment, positive = "positive")
+  # Accuracy 값 저장
+  lasso_Accuracy <- c(lasso_Accuracy, lasso_cM$overall[1])
+  # lambda의 log 값 저장
+  log_lambda <- c(log_lambda, log(lasso_model$lambda[i]))
+}
+
+# lambda 값에 따른 Accuracy 값 데이터프레임
+df_lasso1 <- data.frame(log_lambda = log_lambda, Accuracy = lasso_Accuracy) 
+df_lasso1
+
+# lambda 값에 따른 Accuracy 값 시각화
+ggplot(df_lasso1, aes(x=log_lambda, y=Accuracy)) + geom_point() + geom_line()
+
+# model feature의 coefficient 값 예
+coef(lasso_model, s = lasso_model$lambda[35])[1:5,1]
+
+# model에서 사용한 feature의 개수
+sum(coef(lasso_model, s = lasso_model$lambda[35]) != 0)
+
+# 최적 lambda 값
+lasso_model$lambda[35]
+```
+
+**Answer) DTM data를 사용시, Lasso regularization 적용 logistic regression model은 lambda 값이 0.005839471일 때 validation set에 대한 Accuracy가 가장 높았으며 그 때 Accuracy 값은 0.821이다. feature의 수는 353개 중에 154개가 줄어 199개가 되었다.**
+
+-   TF-IDF data
+
+```{r}
+# TF-IDF 데이터를 사용한 feature matrix 생성
+train_tfidfX <- model.matrix(sentiment~., data=imdb_tfidf_train)[,-1] 
+train_tfidfY <- imdb_tfidf_train$sentiment
+
+# logistic regression model에 lasso regularization 적용
+lasso_tfidf_model <- glmnet(x=train_tfidfX, y=train_tfidfY, alpha = 1, family="binomial")
+
+# lambda에 따른 coefficient 값 변화
+plot(lasso_tfidf_model, xvar="lambda", label = TRUE)
+
+# TF-IDF 데이터를 사용한 예측할 validation set의 feature matrix 생성
+valid_imdb_tfidf <- model.matrix(sentiment~.,imdb_tfidf_valid)[,-1]
+
+# vector 초기화
+log_lambda <- vector()
+lasso_Accuracy <- vector()
+
+# lasso_model에서 사용한 lambda 값의 변화에 따른 validation set 예측 결과
+for (i in 1:84){
+  # training set으로 학습된 model로 validation set 예측
+  lasso_tfidf_pred <- predict(lasso_tfidf_model, s=lasso_tfidf_model$lambda[i], newx = valid_imdb_tfidf, type = "class")
+  lasso_tfidf_cM <- confusionMatrix(factor(lasso_tfidf_pred, levels = c("negative", "positive")), imdb_tfidf_valid$sentiment, positive = "positive")
+  # Accuracy 값 저장
+  lasso_Accuracy <- c(lasso_Accuracy, lasso_tfidf_cM$overall[1])
+  # lambda의 log 값 저장
+  log_lambda <- c(log_lambda, log(lasso_model$lambda[i]))
+}
+
+# lambda 값에 따른 Accuracy 값 데이터프레임
+df_lasso2 <- data.frame(log_lambda = log_lambda, Accuracy = lasso_Accuracy)
+df_lasso2
+
+max(lasso_Accuracy)
+
+# lambda 값에 따른 Accuracy 값 시각화
+ggplot(df_lasso2, aes(x=log_lambda, y=Accuracy)) + geom_point() + geom_line()
+
+# model feature의 coefficient 값 예
+coef(lasso_tfidf_model, s = lasso_model$lambda[26])[1:5,1]
+
+# model에서 사용한 feature의 개수
+sum(coef(lasso_tfidf_model, s = lasso_model$lambda[26]) != 0)
+
+# 최적 lambda 값
+lasso_model$lambda[26]
+```
+
+**Answer) TF-IDF data를 사용시, Lasso regularization 적용 logistic regression model은 lambda 값이 0.01348994일 때 validation set에 대한 Accuracy가 가장 높았으며 그 때 Accuracy 값은 0.808이다. feature의 수는 353개 중에 233개가 줄어 120개가 되었다.**
+
+**최종적으로 Lasso regularization 적용 logistic regression model에서는 DTM data를 사용하고 파라미터 값으로 lambda 값을 0.005839471을 넣었을 때 모델이 성능이 가장 좋다.**
+
+**Lasso regularization은 Ridge regularization과 비교할 때 Accuracy 측면에서 성능은 비슷하지만 feature의 수를 줄이는 효과가 있기에 모델 해석력 측면에서 향상되었다고 말할 수 있을 것이다.**
+
+#### ● SVM model
+
+**SVM model은 계산 시간을 고려하여 linear kernel과 RBF kernel의 cost 범위 값을 약간 다르게 설정하였다.**
+
+-   DTM data
+
+```{r}
+# SVM의 Accuracy 값을 저장할 vector 생성
+svm_Accuracy <- vector()
+
+# linear method svm model 사용시 cost 값 변화에 따른 validation set 예측 결과 
+for (c in c(0.001,0.01,0.1,1,10,100)) {
+  # training set으로 model 학습
+  svmfit <- svm(sentiment~., data=imdb_train, kernel="linear", cost = c, scale=TRUE)
+  # 학습된 model로 validation set 예측
+  svm_pred <- predict(svmfit, imdb_valid)
+  svm_cM <- confusionMatrix(svm_pred, imdb_valid$sentiment, positive = "positive")
+  # Accuracy 값 저장
+  svm_Accuracy <- c(svm_Accuracy, svm_cM$overall[1])
+}
+
+# cost 값에 따른 Accuracy 값 데이터프레임
+df_svm1 <- data.frame(cost = c(0.001,0.01,0.1,1,10,100), Accuracy = svm_Accuracy)
+df_svm1
+
+# cost 값에 따른 Accuracy 값 시각화
+svm_plot1 <- ggplot(df_svm1, aes(x=cost, y=Accuracy)) + geom_point() + geom_line()
+svm_plot1
+
+# vector 초기화
+svm_Accuracy <- vector()
+parameter <- vector()
+
+# RBF kernal method svm model 사용시 cost 값과 gamma 값 변화에 따른 validation set 예측 결과 
+for (c in c(0.01,0.1,1,10,100)){ 
+  for (g in c(0.01,0.1,1,10,100)){
+    # training set으로 model 학습
+    svmfit <- svm(sentiment~., data=imdb_train, kernel="radial", gamma = g, cost = c)
+    # 학습된 model로 validation set 예측
+    svm_pred <- predict(svmfit, imdb_valid)
+    svm_cM <- confusionMatrix(svm_pred, imdb_valid$sentiment, positive = "positive")
+    # Accuracy 값 저장
+    svm_Accuracy <- c(svm_Accuracy, svm_cM$overall[1])
+    # parameter 값 저장
+    parameter <- c(parameter, c(paste("cost:", c, "& gamma:", g)))
+  }}
+
+# cost 값에 따른 Accuracy 값 데이터프레임
+df_svm2 <- data.frame(parameter, Accuracy = svm_Accuracy)
+df_svm2
+
+# cost 값에 따른 Accuracy 값 시각화
+svm_plot2 <- ggplot(df_svm2, aes(y=parameter, x=Accuracy)) + geom_point(color = "red") + geom_segment(aes(x = 0, xend = Accuracy, y = reorder(parameter, Accuracy), yend = reorder(parameter, Accuracy))) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+svm_plot2
+```
+
+**Answer) DTM data를 사용시, linear method SVM model은 cost 값이 0.001일 때 validation set에 대한 Accuracy가 가장 높았으며 그 때 Accuracy 값은 0.810이다. RBF kernel SVM model은 cost 값이 1, gamma 값이 0.01일 때 validation set에 대한 Accuracy가 가장 높았으며 그 때 Accuracy 값은 0.758이다.**
+
+-   TF-IDF data
+
+```{r}
+# vector 초기화
+svm_Accuracy <- vector()
+
+# linear method svm model 사용시 cost 값 변화에 따른 validation set 예측 결과 
+for (c in c(0.001,0.01,0.1,1,10,100)) {
+  # training set으로 model 학습
+  tfidf_svmfit <- svm(sentiment~., data=imdb_tfidf_train, kernel="linear", cost = c, scale=TRUE)
+  # 학습된 model로 validation set 예측
+  svm_tfidf_pred <- predict(tfidf_svmfit, imdb_valid)
+  svm_tfidf_cM <- confusionMatrix(svm_tfidf_pred, imdb_tfidf_valid$sentiment, positive = "positive")
+  # Accuracy 값 저장
+  svm_Accuracy <- c(svm_Accuracy, svm_tfidf_cM$overall[1])
+}
+
+# cost 값에 따른 Accuracy 값 데이터프레임
+df_svm3 <- data.frame(cost = c(0.001,0.01,0.1,1,10,100), Accuracy = svm_Accuracy)
+df_svm3
+
+# cost 값에 따른 Accuracy 값 시각화
+svm_plot3 <- ggplot(df_svm3, aes(x=cost, y=Accuracy)) + geom_point() + geom_line()
+svm_plot3
+
+# vector 초기화
+svm_Accuracy <- vector()
+parameter <- vector()
+
+# RBF kernal method svm model 사용시 cost 값과 gamma 값 변화에 따른 validation set 예측 결과 
+for (c in c(0.01,0.1,1,10,100)){ 
+  for (g in c(0.01,0.1,1,10,100)){
+    # training set으로 model 학습
+    tfidf_svmfit <- svm(sentiment~., data=imdb_tfidf_train, kernel="radial", gamma = g, cost = c)
+    # 학습된 model로 validation set 예측
+    svm_tfidf_pred <- predict(tfidf_svmfit, imdb_tfidf_valid)
+    svm_tfidf_cM <- confusionMatrix(svm_tfidf_pred, imdb_tfidf_valid$sentiment, positive = "positive")
+    # Accuracy 값 저장
+    svm_Accuracy <- c(svm_Accuracy, svm_tfidf_cM$overall[1])
+    # parameter 값 저장
+    parameter <- c(parameter, c(paste("cost:", c, "& gamma:", g)))
+  }}
+
+# cost 값에 따른 Accuracy 값 데이터프레임
+df_svm4 <- data.frame(parameter, Accuracy = svm_Accuracy)
+df_svm4
+
+# cost 값에 따른 Accuracy 값 시각화
+svm_plot4 <- ggplot(df_svm4, aes(y=parameter, x=Accuracy)) + geom_point(color = "red") + geom_segment(aes(x = 0, xend = Accuracy, y = reorder(parameter, Accuracy), yend = reorder(parameter, Accuracy))) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+svm_plot4
+```
+
+**Answer) TF-IDF data를 사용시, linear method SVM model은 cost 값이 0.01일 때 validation set에 대한 Accuracy가 가장 높았으며 그 때 Accuracy 값은 0.784이다. RBF kernel SVM model은 cost 값이 10, gamma 값이 0.01일 때와 cost값이 100, gamma 값이 0.01일 때, validation set에 대한 Accuracy가 가장 높았으며 그 때 Accuracy 값은 0.719이다.**
+
+**최종적으로 SVM model에서는 DTM data를 사용하고 linear kernel 방식, 파라미터 값으로 cost 값을 0.001을 넣었을 때 모델이 성능이 가장 좋다.**
+
+#### ● Decision Tree model
+
+-   DTM data
+
+```{r}
+# DTM data로 Decision tree model 학습
+set.seed(123)
+ct <- rpart(sentiment~., data=imdb_train, method="class", control = list(cp=0))
+
+# 생성 tree 시각화
+rpart.plot(ct)
+
+# cross-validation 결과
+printcp(ct)
+
+# Decision Tree의 Accuracy 값을 저장할 vector 생성
+CP <- vector()
+ct_Accuracy <- vector()
+
+# Decision tree model 사용시 CP 값 변화에 따른 validation set 예측 결과
+for (i in 1:18){
+  # cp가 0이었을 때 tree에서 pruning 진행
+  prune_ct <- prune(ct, cp = ct$cptable[i])
+  # pruned tree model로 validation set 예측
+  ct_pred <- predict(prune_ct, newdata=imdb_valid, type="class")
+  ct_cM <- confusionMatrix(factor(ct_pred, levels = c("negative", "positive")), imdb_valid$sentiment, positive = "positive")
+  # CP 값 저장
+  CP <- c(CP, ct$cptable[i])
+  # Accuracy 값 저장
+  ct_Accuracy <- c(ct_Accuracy, ct_cM$overall[1])
+}
+
+# CP 값에 따른 Accuracy 값 데이터프레임
+df_ct1 <- data.frame(CP, Accuracy = ct_Accuracy)
+df_ct1
+
+# CP 값에 따른 Accuracy 값 시각화
+ct_plot1 <- ggplot(df_ct1, aes(x=CP, y=Accuracy)) + geom_point() + geom_line()
+ct_plot1
+
+# Accuracy가 가장 높은 tree 시각화
+prune_ct <- prune(ct, cp = ct$cptable[12])
+rpart.plot(prune_ct)
+```
+
+**Answer) DTM data를 사용시, Decision tree model은 CP 값이 0.0030150754일 때 validation set에 대한 Accuracy가 가장 높았으며 그 때 Accuracy 값은 0.719이다.**
+
+-   TF-IDF data
+
+```{r}
+# TF-IDF data로 Decision tree model 학습
+set.seed(123)
+tfidf_ct <- rpart(sentiment~., data=imdb_tfidf_train, method="class", control = list(cp=0))
+
+# 생성 tree 시각화
+rpart.plot(tfidf_ct)
+
+# cross-validation 결과
+printcp(tfidf_ct)
+
+# Decision Tree의 Accuracy 값을 저장할 vector 생성
+CP <- vector()
+ct_Accuracy <- vector()
+
+# Decision tree model 사용시 CP 값 변화에 따른 validation set 예측 결과
+for (i in 1:18){
+  # cp가 0이었을 때 tree에서 pruning 진행
+  prune_tfidf_ct <- prune(tfidf_ct, cp = ct$cptable[i])
+  # pruned tree model로 validation set 예측
+  ct_tfidf_pred <- predict(prune_tfidf_ct, newdata=imdb_tfidf_valid, type="class")
+  ct_tfidf_cM <- confusionMatrix(factor(ct_tfidf_pred, levels = c("negative", "positive")), imdb_tfidf_valid$sentiment, positive = "positive")
+  # CP 값 저장
+  CP <- c(CP, tfidf_ct$cptable[i])
+  # Accuracy 값 저장
+  ct_Accuracy <- c(ct_Accuracy, ct_tfidf_cM$overall[1])
+}
+
+# CP 값에 따른 Accuracy 값 데이터프레임
+df_ct2 <- data.frame(CP, Accuracy = ct_Accuracy)
+df_ct2
+
+# CP 값에 따른 Accuracy 값 시각화
+ct_plot2 <- ggplot(df_ct2, aes(x=CP, y=Accuracy)) + geom_point() + geom_line()
+ct_plot2
+
+# Accuracy가 가장 높은 tree 시각화
+prune_tfidf_ct <- prune(tfidf_ct, cp = tfidf_ct$cptable[9])
+rpart.plot(prune_tfidf_ct)
+```
+
+**Answer) TF-IDF data를 사용시, Decision tree model은 CP 값이 0.006030151 일 때 validation set에 대한 Accuracy가 가장 높았으며 그 때 Accuracy 값은 0.720이다.**
+
+**최종적으로 Decision tree model에서는 TF-IDF data를 사용하고 파라미터 값으로 CP 값을 0.006030151을 넣었을 때 모델이 성능이 가장 좋다.**
+
+**다른 모델에서는 모델 학습 과정에서 cross-validation을 사용하지 않았지만 Decision tree model에서는 코드의 제약사항에 의해 cross-validation을 적용하여 모델을 학습하였다. 모델 학습 과정에서 training set의 학습이 다른 모델에 비해 부분적으로 많은 횟수로 진행됬다고 볼 수 있어 차이점이 있다.**
+
+#### ● RadomForest model
+
+```{r}
+# ntree의 값을 정하기 위해 ntree를 500으로 설정하여 model을 training.
+rf_imdb_ntree <- randomForest(sentiment~., data = imdb_train, ntree=500)
+
+# tree의 개수에 따른 error 변화
+plot(rf_imdb_ntree)
+```
+
+**그래프를 보면 tree의 개수가 200 이상일 때부터는 error의 큰 차이가 없기 때문에 모델 학습에 시간을 고려하여 ntree 값을 200으로 고정함.**
+
+-   DTM data
+
+```{r}
+# Accuracy를 저장할 vector 생성 
+rf_Accuracy <- vector()
+
+# model의 mrty 값을 i의 조건으로 변화시켰을 때, validation set 예측 결과
+for (i in seq(1,354,by=20)){ 
+ set.seed(123)
+ # training set으로 RandomForest model 학습
+ rf_imdb <- randomForest(sentiment~., data = imdb_train, ntree = 200, mtry = i)
+ # validation set에 대한 class 예측
+ rf_pred <- predict(rf_imdb, newdata=imdb_valid, type="class")
+ rf_cM <- confusionMatrix(rf_pred, imdb_valid$sentiment, positive = "positive")
+ # Accuracy 값 저장
+ rf_Accuracy <- c(rf_Accuracy, rf_cM$overall[1])
+}
+
+# mtry 값에 따른 Accuracy 값 데이터프레임 생성
+df1 <- data.frame(mtry = seq(1,354,by=20), Accuracy = rf_Accuracy)
+df1
+
+# mtry 값에 따른 Accuracy 값 시각화
+rf_plot1 <- ggplot(df1, aes(x=mtry, y=Accuracy)) + geom_point() + geom_line()
+rf_plot1
+  
+# vector 초기화
+rf_Accuracy <- vector()
+
+# 더 좋은 성능을 가지는 mtry 값을 찾기 위해 가장 Accuracy가 높은 mtry 값 주변 범위로 i 값을 설정하여 한 번 더 반복 
+for (i in 8:28) {
+ set.seed(123)
+ rf_imdb <- randomForest(sentiment~., data = imdb_train, ntree = 200, mtry = i)
+ rf_pred <- predict(rf_imdb, newdata=imdb_valid, type="class")
+ rf_cM <- confusionMatrix(rf_pred, imdb_valid$sentiment, positive = "positive")
+ rf_Accuracy <- c(rf_Accuracy, rf_cM$overall[1])
+}
+
+# mtry 값에 따른 Accuracy 값 데이터프레임 생성
+df2 <- data.frame(mtry = 8:28, Accuracy = rf_Accuracy)
+df2
+
+# mtry 값에 따른 Accuracy 값 시각화
+rf_plot2 <- ggplot(df2, aes(x=mtry, y=Accuracy)) + geom_point() + geom_line()
+rf_plot2
+
+```
+
+**Answer) 계산량을 줄이기 위해 mtry의 범위를 넓게 잡고 간격 또한 넓게 잡아서 예측 결과를 도출하고, 그 결과가 좋은 mtry 값 주변 범위에서 예측을 다시 한 번 실시하였다.**
+
+**DTM data를 사용시, RandomForest model은 mtry 값이 10일 때 validation set에 대한 Accuracy가 가장 높았으며 그 때 Accuracy 값은 0.814이다.**
+
+-   TF-IDF data
+
+```{r}
+# Accuracy를 저장할 vector 생성 
+rf_tfidf_Accuracy <- vector()
+
+# TF-IDF 적용 data 사용
+# model의 mrty 값을 i의 조건으로 변화시켰을 때, validation set 예측 결과
+for (i in seq(1,354,by=20)){ 
+ set.seed(123)
+ rf_imdb_tfidf <- randomForest(sentiment~., data = imdb_tfidf_train, ntree = 200, mtry = i)
+ rf_pred_tfidf <- predict(rf_imdb_tfidf, newdata=imdb_tfidf_valid, type="class")
+ rf_tfidf_cM <- confusionMatrix(rf_pred_tfidf, imdb_tfidf_valid$sentiment, positive = "positive")
+ rf_tfidf_Accuracy <- c(rf_tfidf_Accuracy, rf_tfidf_cM$overall[1]) 
+}
+
+# mtry 값에 따른 Accuracy 값 데이터프레임 생성
+df3 <- data.frame(mtry = seq(1,354,by=20), Accuracy = rf_tfidf_Accuracy)
+df3
+
+# mtry 값에 따른 Accuracy 값 시각화
+rf_plot3 <- ggplot(df3, aes(x=mtry, y=Accuracy)) + geom_point() + geom_line()
+rf_plot3
+
+# vector 초기화
+rf_tfidf_Accuracy <- vector()
+
+# 더 좋은 성능을 가지는 mtry 값을 찾기 위해 가장 Accuracy가 높은 mtry 값 주변 범위로 i 값을 설정하여 한 번 더 반복 
+for (i in 8:28){ 
+ set.seed(123)
+ rf_imdb_tfidf <- randomForest(sentiment~., data = imdb_tfidf_train, ntree = 200, mtry = i)
+ rf_pred_tfidf <- predict(rf_imdb_tfidf, newdata=imdb_tfidf_valid, type="class")
+ rf_tfidf_cM <- confusionMatrix(rf_pred_tfidf, imdb_tfidf_valid$sentiment, positive = "positive")
+ rf_tfidf_Accuracy <- c(rf_tfidf_Accuracy, rf_tfidf_cM$overall[1]) 
+}
+
+# mtry 값에 따른 Accuracy 값 데이터프레임 생성
+df4 <- data.frame(mtry = 8:28, Accuracy = rf_tfidf_Accuracy)
+df4
+
+# mtry 값에 따른 Accuracy 값 시각화
+rf_plot4 <- ggplot(df4, aes(x=mtry, y=Accuracy)) + geom_point() + geom_line()
+rf_plot4
+```
+
+**Answer) TF-IDF data를 사용시, RandomForest model은 mtry 값이 13일 때 validation set에 대한 Accuracy가 가장 높았으며 그 때 Accuracy 값은 0.807이다.**
+
+**최종적으로 RandomForest model에서는 DTM data를 사용하고 파라미터 값으로 ntree 값을 200, mtry 값을 10을 넣었을 때 모델이 성능이 가장 좋다.**
+
+**예상대로 Decision tree보다 tree의 수를 더 많이 생성해보기 때문에 성능이 더 좋게 나타났다.**
+
+#### \< 최종 결과\>
+
+| MODEL                    | DTM/TF-IDF | Parameter                    | Accuracy |
+|------------------|------------------|-------------------|------------------|
+| KNN                      | TF-IDF     | k=17                         | 0.664    |
+| 기본 Logistic regression | TF-IDF     | \-                           | 0.783    |
+| Ridge regularization     | DTM        | lambda = 0.0421657           | 0.820    |
+| Lasso regularization     | DTM        | lambda = 0.005839471         | 0.821    |
+| SVM                      | DTM        | linear kernel & cost = 0.001 | 0.810    |
+| Decision tree            | TF-IDF     | CP = 0.006030151             | 0.720    |
+| Random Forest            | DTM        | mtry = 10                    | 0.814    |
+
+B.  최종적으로 선택한 모델은 무엇이며 이 모델의 training set accuracy와 test set accuracy는 얼마인가?
+
+```{r}
+# validation set을 training set에 병합하여 최종 training set 생성
+final_train <- imdb[1:3000,]
+
+# 최종 test set 생성
+final_test <- imdb[3001:10000,]
+
+# 최종 training set을 사용한 feature matrix 생성
+final_trainX <- model.matrix(sentiment~., data=final_train)[,-1] 
+final_trainY <- final_train$sentiment
+
+# 최종 모델로 선정한 logistic regression model에 lasso regularization 적용하여 학습
+final_model <- glmnet(x=final_trainX, y=final_trainY, alpha = 1, family="binomial")
+
+# 학습된 최종 모델을 이용하여 training set 예측
+final_train_pred <- predict(final_model, s=lasso_model$lambda[35], newx = final_trainX, type = "class")
+
+# training set에 대한 confusion matrix
+confusionMatrix(factor(final_train_pred, levels = c("negative", "positive")), final_train$sentiment, positive = "positive")
+
+# 최종 test set을 사용한 feature matrix 생성
+test_imdb <- model.matrix(sentiment~.,final_test)[,-1]
+
+# 학습된 최종 모델을 이용하여 test set 예측
+final_test_pred <- predict(final_model, s=lasso_model$lambda[35], newx = test_imdb, type = "class")
+
+# test set에 대한 confusion matrix
+confusionMatrix(factor(final_test_pred, levels = c("negative", "positive")), final_test$sentiment, positive = "positive")
+```
+
+**Answer) 최종적으로 선택한 모델은 Accuracy 측면에서도 0.821로 가장 성능이 좋고 모델 해석력 측면에서도 용이한 Lasso regularization 적용 logistic regression을 선정하였다. 모델 선정을 할 때, 가장 좋은 성능을 보였던 파라미터 lambda 값인 0.005839471를 사용하였고 모델 학습시 validation set까지도 training set에 포함하여 학습하였다.**
+
+**학습된 최종 모델로 예측 결과, training set Accuracy는 0.8633, test set Accuracy는 0.8127가 나타났다.**
